@@ -1,0 +1,238 @@
+library(rpart)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+library(xgboost)
+library(randomForest)
+
+
+train <- read.csv('train.csv', stringsAsFactors=FALSE)
+test <- read.csv('test.csv', stringsAsFactors=FALSE)
+
+train %>% head()
+test %>% head()
+
+colnames(train)[1] <- 'ID'
+test$ID <- as.character(test$ID)
+
+full <- bind_rows(train, test)
+
+# Get the time value:
+full$TimeValue <- sapply(full$AgeuponOutcome,  
+                         function(x) strsplit(x, split = ' ')[[1]][1])
+
+# Now get the unit of time:
+full$UnitofTime <- sapply(full$AgeuponOutcome,  
+                          function(x) strsplit(x, split = ' ')[[1]][2])
+
+# Fortunately any "s" marks the plural, so we can just pull them all out
+full$UnitofTime <- gsub('s', '', full$UnitofTime)
+
+full$TimeValue  <- as.numeric(full$TimeValue)
+full$UnitofTime <- as.factor(full$UnitofTime)
+
+# Make a multiplier vector
+multiplier <- ifelse(full$UnitofTime == 'day', 1,
+                     ifelse(full$UnitofTime == 'week', 7,
+                            ifelse(full$UnitofTime == 'month', 30, # Close enough
+                                   ifelse(full$UnitofTime == 'year', 365, NA))))
+
+# Apply our multiplier
+full$AgeinDays <- full$TimeValue * multiplier
+
+# Replace blank names with "Nameless"
+full$Name <- ifelse(nchar(full$Name)==0, 'Nameless', full$Name)
+
+# Make a name v. no name variable
+full$HasName[full$Name == 'Nameless'] <- 0
+full$HasName[full$Name != 'Nameless'] <- 1
+
+# Replace blank sex with most common
+full$SexuponOutcome <- ifelse(nchar(full$SexuponOutcome)==0, 
+                              'Spayed Female', full$SexuponOutcome)
+
+# Extract time variables from date (uses the "lubridate" package)
+full$Hour    <- hour(full$DateTime)
+full$Weekday <- wday(full$DateTime)
+full$Month   <- month(full$DateTime)
+full$Year    <- year(full$DateTime)
+full$Weekend <- ifelse(weekdays(as.POSIXct(full$DateTime)) == "Saturday" |
+                         weekdays(as.POSIXct(full$DateTime)) == "Sunday", '1', '0')
+
+# Time of day may also be useful
+full$TimeofDay <- ifelse(full$Hour > 5 & full$Hour < 11, 'morning',
+                         ifelse(full$Hour > 10 & full$Hour < 16, 'midday',
+                                ifelse(full$Hour > 15 & full$Hour < 20, 'lateday', 'night')))
+
+# Put factor levels into the order we want
+full$TimeofDay <- factor(full$TimeofDay, 
+                         levels = c('morning', 'midday',
+                                    'lateday', 'night'))
+
+summary(full$AgeinDays)
+
+# Use "grepl" to look for "Mix"
+full$IsMix <- ifelse(grepl('Mix', full$Breed), 1, 0)
+
+# Split on "/" and remove " Mix" to simplify Breed
+
+full$SimpleBreed   <- ifelse(str_detect(full$Breed,"/"),"Mixed","Pure")
+full$BreedLifespan <- ifelse(str_detect(full$Breed,"Domestic Shorthair Mix"),"14",
+                      ifelse(str_detect(full$Breed,"Pit Bull Mix"),"15",
+                      ifelse(str_detect(full$Breed,"Labrador Retriever Mix"),"11","0")))
+full$BreedWeight  <-  ifelse(str_detect(full$Breed,"Domestic Shorthair Mix"),"11",
+                      ifelse(str_detect(full$Breed,"Pit Bull Mix"),"58",
+                      ifelse(str_detect(full$Breed,"Labrador Retriever Mix"),"69","0")))
+full$BreedHeight  <-  ifelse(str_detect(full$Breed,"Domestic Shorthair Mix"),"10",
+                      ifelse(str_detect(full$Breed,"Pit Bull Mix"),"24",
+                      ifelse(str_detect(full$Breed,"Labrador Retriever Mix"),"69","0")))
+full$Dangerous  <-  ifelse(str_detect(full$Breed,"Rottweiler"),"Yes",
+                      ifelse(str_detect(full$Breed,"Pit Bull"),"Yes","0"))
+
+# Use strsplit to grab the first color
+full$SimpleColor <- sapply(full$Color, 
+                           function(x) strsplit(x, split = '/| ')[[1]][1])
+full$Favouritecolor <- ifelse(str_detect(full$SimpleColor,"Black"),"1",
+                       ifelse(str_detect(full$SimpleColor,"Brown"),"2","0"))
+
+levels(factor(full$SimpleColor))
+
+# Use "grepl" to look for "Intact"
+full$Intact <- ifelse(grepl('Intact', full$SexuponOutcome), 1,
+                      ifelse(grepl('Unknown', full$SexuponOutcome), 'Unknown', 0))
+
+# Use "grepl" to look for "Neartured"
+full$Neutered <- ifelse(grepl('Neutered', full$SexuponOutcome), 1,
+                      ifelse(grepl('Unknown', full$SexuponOutcome), 'Unknown', 0))
+
+# Use "grepl" to look for "Spayed"
+full$Spayed <- ifelse(grepl('Spayed', full$SexuponOutcome), 1,
+                        ifelse(grepl('Unknown', full$SexuponOutcome), 'Unknown', 0))
+
+# Use "grepl" to look for "Spayed"
+full$Unknown <- ifelse(grepl('Unknown', full$SexuponOutcome), 1,
+                      ifelse(grepl('Unknown', full$SexuponOutcome), 'Unknown', 0))
+
+# Use "grepl" to look for sex
+full$Sex <- ifelse(grepl('Male', full$SexuponOutcome), 'Male',
+                   ifelse(grepl('Unknown', full$Sex), 'Unknown', 'Female'))
+
+# Use rpart to predict the missing age values
+age_fit <- rpart(AgeinDays ~ AnimalType + Sex + Intact + SimpleBreed + HasName, 
+                 data = full[!is.na(full$AgeinDays), ], 
+                 method = 'anova')
+# Impute predicted age values where missing using "predict"
+full$AgeinDays[is.na(full$AgeinDays)] <- predict(age_fit, full[is.na(full$AgeinDays), ])
+as.factor(full$HasName)
+# All gone? Yes.
+sum(is.na(full$AgeinDays))
+
+# Use the age variable to make a puppy/kitten variable
+full$Lifestage[full$AgeinDays < 365] <- 'baby'
+full$Lifestage[full$AgeinDays >= 365] <- 'adult'
+
+
+full$Lifestage <- factor(full$Lifestage)
+
+factorVars <- c('Name','OutcomeType','OutcomeSubtype','AnimalType',
+                'SexuponOutcome','AgeuponOutcome','SimpleBreed','SimpleColor',
+                'HasName','IsMix','Intact','Sex','TimeofDay','Lifestage')
+
+full[factorVars] <- lapply(full[factorVars], function(x) as.factor(x))
+
+# Split up train and test data
+train <- full[1:26729, ]
+test  <- full[26730:nrow(full), ]
+
+write.csv(train,"train1.csv")
+write.csv(test,"test1.csv")
+write.csv(full,"fulldata_train_test.csv")
+LK <- as.numeric(as.factor(train$OutcomeType))
+GJ <- as.numeric(as.factor(train$Weekend))
+cor(LK,GJ)
+
+
+#                            Build xgboost model                              #
+
+
+# prepare for xgboost model - is data correct type?
+class(train$OutcomeType)
+
+# No. Need to change to numeric
+y_train <- as.numeric(as.factor(train$OutcomeType)) - 1
+
+# keep track of the labels
+labels_train <- data.frame(train$OutcomeType, y_train)
+
+# xgboost-specific design matrices
+xgb_train <- xgb.DMatrix(model.matrix(~AnimalType+AgeinDays+Intact+
+                                        HasName+Hour+TimeofDay+Weekday+Month+Year+SimpleBreed+
+                                        BreedWeight+BreedLifespan+BreedHeight+Dangerous+Favouritecolor+
+                                        SimpleColor+IsMix+Sex+Unknown+Lifestage+Spayed+Neutered+Unknown
+                                       , data=train),
+                         label=y_train, missing=NA)
+xgb_test <- xgb.DMatrix(model.matrix(~AnimalType+AgeinDays+Intact+
+                                       HasName+Hour+TimeofDay+Weekday+Month+Year+SimpleBreed+
+                                       BreedWeight+BreedLifespan++BreedHeight+Dangerous+Favouritecolor+
+                                       SimpleColor+IsMix+Sex+Unknown+Lifestage+Spayed+Neutered+Unknown
+                                       , data=test), missing=NA)
+
+xgb.cv(data=xgb_train, label=y_train, nfold=5, nround=70, objective='multi:softprob',
+num_class=5, eval_metric='mlogloss')
+# build model
+xgb_model <- xgboost(xgb_train, y_train, nrounds=46, objective='multi:softprob',
+                     num_class=5, eval_metric='mlogloss',
+                     early.stop.round=TRUE)
+
+# make predictions
+predictions <- predict(xgb_model, xgb_test)
+
+# reshape predictions
+xgb_preds <- data.frame(t(matrix(predictions, nrow=5, ncol=length(predictions)/5)))
+
+# attach ID column
+xgb_preds['ID'] <- test['ID']
+
+# name columns
+colnames(xgb_preds) <- c('Adoption', 'Died', 'Euthanasia', 'Return_to_owner', 'Transfer')
+
+# quick peek - looks good
+head(xgb_preds)
+write.csv(xgb_preds,"Submission.csv")
+
+
+# gbm model prediction of OutcomeSubtype
+y_train1 <- as.numeric(as.factor(train$OutcomeSubtype)) - 1
+
+# keep track of the labels
+labels_train1 <- data.frame(train$OutcomeSubtype, y_train)
+
+# xgboost-specific design matrices
+xgb_train1 <- xgb.DMatrix(model.matrix(~AnimalType+AgeinDays+Intact+
+                                        HasName+Hour+TimeofDay+Weekday+Month+Year+SimpleBreed+
+                                        SimpleColor+IsMix+Sex+Unknown+Lifestage, 
+                                       data=train),
+                         label=y_train1, missing=NA)
+xgb_test1 <- xgb.DMatrix(model.matrix(~AnimalType+AgeinDays+Intact+
+                                       HasName+Hour+TimeofDay+Weekday+Month+Year+SimpleBreed+
+                                       SimpleColor+IsMix+Sex+Unknown+Lifestage
+                                      , data=test), missing=NA)
+xgb_model1 <- xgboost(xgb_train, y_train, nrounds=46, objective='multi:softprob',
+                     num_class=5, eval_metric='mlogloss',
+                     early.stop.round=TRUE)
+
+# make predictions
+predictions <- predict(xgb_model1, xgb_test1)
+
+# reshape predictions
+xgb_preds <- data.frame(t(matrix(predictions, nrow=5, ncol=length(predictions)/5)))
+
+#Predicting the test data to get the output probabilities of the test data predictions
+dim(predictions) <- c(nrow(test),5)
+colnames(predictions) <- levels(train$OutcomeSubtype)
+
+options(scipen=100)
+
+write.csv(testPreds2,file="GBM_Test_Prediction_Outcomesubtype.csv",row.names=FALSE)
+TYZ <- read.csv("GBM_Test_Prediction_Outcomesubtype.csv")
