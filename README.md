@@ -7,4 +7,4 @@ Some of the data manipulations done are as follows.
 3. Added new variables from the existing variable "Date" such as time of day, day of the week and public holidays.
 Finally performed predictive analytics by building a predictive model using Xg-Boost advanced machine learning algorithm and attained 
 a logloss of 0.73.
-
+Was placed in the top 11% in the kaggle leaderboard of 1600 participants.
